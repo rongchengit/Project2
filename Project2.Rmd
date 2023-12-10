@@ -1,0 +1,436 @@
+---
+title: "DATA624 Project 2 Brewing Models"
+author: "Taha Ahmad, Rong Chen"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r package loading, message=FALSE, warning=FALSE}
+library(caret)
+library(tidyverse)
+```
+
+
+## Introduction
+
+New regulations are requiring us to understand our manufacturing process and the predictive factors with modeling. We also need to choose an optimal predictive model of PH to report to our boss. We have been given historical data regarding our manufacturing process that has already been split into a training set of "StudentData.xlsx" and a test set of "StudentEvaluation.xlsx".
+
+This will be a technical report that showcases our process of tidying the data received and exploring it.
+
+## Data Preparation and Exploration
+
+The first part of the our workflow is tidying our data to prepare it for analysis. Tidying involves loading the data and then preparing it to be in the correct format to generate predictive models for. While we are tidying our data we are also visualizing and exploring our variables and their relationships in order to best inform the model building process.
+
+### Load
+
+We begin our tidying journey by loading in the data from the Excel files utilizing readxl's read_xlsx() function. We see that we are dealing with a dataset containing 33 different columns where all but the brand code seem to be numeric variables. There are additionally 2,571 different samples within our training dataset. A good proportion relative to the amount of features we have.
+
+```{r, message=FALSE}
+require(readxl)
+
+file <- "StudentData.xlsx"
+
+train <- readxl::read_xlsx(path = file)
+
+file <- "StudentEvaluation.xlsx"
+
+test <- readxl::read_xlsx(path = file)
+
+glimpse(train)
+```
+Looking up some choice column names such as balling, mnf flow, and intuiting alcohol level we understand that we are attempting to model the pH of a batch of beer depending on its manufacturing parameters.
+
+We notice that the column names do not conform to tibble naming standards and utilize the janitor package's clean_names function to clean up the names for us. This will make things much simpler down the line.
+
+```{r, message=FALSE}
+require(janitor)
+
+train <- train %>% 
+  janitor::clean_names()
+
+test <- test %>% 
+  janitor::clean_names()
+
+colnames(train)
+```
+
+
+We begin transformation of the data by factorizing brand code to more accurately represent the fact that this is a categorical variable of four possible levels: "A","B","C", or "D".
+
+```{r}
+train$brand_code <- as_factor(train$brand_code)
+
+test$brand_code <- as_factor(test$brand_code)
+
+levels(train$brand_code)
+```
+
+### Skim
+
+Our next step is taking a high level overview of the dataset utilizing the powerful skim() tool from the package skimr. We are able to see the missing values contained within each column, the frequencies of the factors, and the distributions of each categorical feature.
+
+We see that overall most rows have a miniscule percentage of missing values besides MFR. MFR has 9% of values missing from the column, but this is not enough missing values to consider dropping the row. We want to impute these missing values utilizing MICE imputation, but first we need to make sure that there isn't a pattern in the values that are missing.
+
+Looking at the brand codes we see that the frequency distribution is not degenerate with one value being almost unrepresented in the data or the highest count being exponentially larger than the second highest.
+
+If we take a peek at the distributions we see that half of our explanatory variables seem to be roughly normally distributed, most of the other half skew towards either the left or the right direction, but there are a curious few categories such as pressure set point and MNF flow that appear to have explicit bimodal distributions. We will want to take a proper look at what we might be able to do to these to shift them closer to normality down the line.
+
+```{r, message=FALSE}
+require(skimr)
+
+train |>
+  skimr::skim()
+```
+
+### Evaluate Missing Values
+
+The next step for pre-processing our data is to look at the missing data to see if there is a significant relationship between multiple columns having missing values together. We see that the vast majority of missing values occur with two or less rows. So most of our data is going to be missing at random rather than in a way that gives us information about other columns.
+
+```{r}
+tibble(NAs = rowSums(is.na(train))) |>
+  filter(NAs != 0) |>
+  group_by(NAs) |>
+  summarise(n = n()) |>
+  ggplot(aes(x = NAs, y = n)) +
+    geom_bar(stat="identity") +
+    labs(title = "3+ combined missing values are rare", subtitle = "# NAs per row", y = NULL, x = NULL) +
+    scale_x_continuous(limits=c(0, 13)) +
+    theme_minimal()
+```
+
+Still we wouldn't know if the missing values are related to index position from just the previous plot. If there were missing values with index position-based patterns then we would assume that there was some information hidden such as the manufacturing process being down during a time period where the data was being collected.
+
+Utilizing the naniar package's vis_miss function we are able to see that there do not seem to be index-based patterns. Lending more credence to the fact that the majority of this data is missing completely at random.
+
+```{r, message=FALSE}
+require(naniar)
+
+naniar::vis_miss(train)
+```
+
+Although the majority of missing data is segmented to an individual feature for the row, we want to look at the breakdown of how rows that have multiple missing values align with which columns the value is missing from. If the more than a hundred rows which had two missing values were all coming from the same combination of columns, we would know that we were missing some meaning with the missing values. 
+
+We do notice some information in the fact that whenever filler speed seems to be missing MFR is also missing, indicating that we can not have an MFR recording if we do not have a filler speed recording. Thankfully this interaction falls within a subset of about 1% of the data, so it is not significant information. Still, keeping in mind our missing values do have some information contained within them lends more credence to utilizing mice as the imputation method. As mice takes into account missing value interactions when imputing values.
+
+```{r}
+naniar::gg_miss_upset(train, 
+                      nsets = naniar::n_var_miss(train)/2,
+                      nintersects = 20)
+```
+
+### Impute Missing Values
+
+With most of our missing values deemed being missing at random, we take the opportunity to impute said values through the mice function from the mice package. Mice is a multiple imputation strategy that relies heavily on finding rows that are geometrically close in distance to the rows with missing values and deriving the imputed value from the mean of these neighbors. This predictive mean matching algorithm is used to find the missing values for each column except brand code. Brand code utilized a polynomial regression model from the other columns to determine the missing values.
+
+```{r, warning=FALSE, message=FALSE}
+require(mice)
+set.seed(123)
+
+imp <- mice::mice(train,
+                  printFlag = FALSE)
+train <- complete(imp)
+
+imp <- mice::mice(test,
+                  printFlag = FALSE)
+test <- complete(imp)
+
+colSums(is.na(train))
+```
+
+### Analyze Distribution
+
+Now that we have our missing values dealt with, we want to deal with the odd distributions that we spotted within the skim. Ensuring that our distributions are close to normality allows for keeping the variance constant which leads to better regression fits for most models. We plot the distributions in better resolution and combine it with a scatterplot of each variable to the respoonse to analyze them further. The DataExplorer's packages of plot_histogram and plot_scatterplot make this process not so mind numbing.
+
+It is here that we can break down our different variables into different classes:
+
+- Those that have enough of a constant covariance with the response variable of ph where transformation is not needed: 
+
+This includes brand_code, carb_pressure, carb_temp, fill_ounces, pc_volume, and pressure_vacuum.
+
+- Those which have their distribution shifted in a way that means covariance is noticeably inconsistent:
+
+This includes ph, carb_volume, psc, psc_co2, psc_fill, carb_pressure1, fill_pressure, filler_speed, hyd_pressure4, mfr, oxygen_filler, temperature, usage_cont, carb_rel.
+
+- Those which have multiple distinct distributions and can be dealt with by changing the variable from continuous to discrete:
+
+This includes hyd_pressure1, hyd_pressure2, hyd_pressure3, mnf_flow, balling, bowl_setpoint, carb_flow, density, air_pressurer, alch_rel, balling_lvl, and pressure_setpoint.
+
+```{r, message=FALSE}
+require(DataExplorer)
+
+DataExplorer::plot_histogram(train,
+                             ggtheme = theme_minimal())
+```
+
+
+```{r}
+DataExplorer::plot_scatterplot(train, 
+                               by = "ph",
+                               ggtheme = theme_minimal(),
+                               geom_point_args = list(alpha = 0.2),
+                               theme_config = list(axis.text.x = element_text(size = 5)))
+```
+
+### Remove Outlier(s)
+
+Our scatterplot breakdown also highlights an outlier within ph that stands outside of the 1.5*IQR range of the category being above 9.5 pH and having no other points near it anywhere. There is no convincing reason for this outlier to exist based on the trends within each category. Thus, we remove it from the dataset by replacing it with the value of the 90th ph quantile.
+
+```{r}
+train <- train %>% 
+  mutate(ph = if_else(ph > 9, quantile(train$ph,.9), ph))
+
+# Since ph is missing from test, this doesn't do anything. Seems like good practice to do it anyways though.
+test <- test %>% 
+  mutate(ph = if_else(ph > 9, quantile(train$ph,.9), ph))
+
+max(train$ph)
+```
+
+### Bin
+
+Some of our variables seem like they contain multiple distinct distributions within their data. The way we will deal with this is to bin the variables into bins that attempt to classify a sample into each individual distribution.
+
+#### Zero Modal
+
+One of the simpler ways to bin distributions is to bin into those where the value is zero and the value is not zero. This works especially well in variables where the mode is zero and there are only two distinct distributions. This includes hyd_pressure1, hyd_pressure2, and hyd_pressure3.
+
+After binning we can begin to see a slight relationship where the median pH increases if the hydraulic pressure stays at 0.
+
+```{r}
+train <- train %>% 
+  mutate(
+    across(c(hyd_pressure1, hyd_pressure2, hyd_pressure3),
+           ~as_factor(if_else(.x < 0.01, "zero", "above_zero"))
+           )
+  ) %>% 
+  rename(hyd_pressure1_bin = hyd_pressure1, hyd_pressure2_bin = hyd_pressure2, hyd_pressure3_bin = hyd_pressure3)
+
+test <- test %>% 
+  mutate(
+    across(c(hyd_pressure1, hyd_pressure2, hyd_pressure3),
+           ~as_factor(if_else(.x < 0.01, "zero", "above_zero"))
+           )
+  ) %>% 
+  rename(hyd_pressure1_bin = hyd_pressure1, hyd_pressure2_bin = hyd_pressure2, hyd_pressure3_bin = hyd_pressure3)
+
+plot_boxplot(train %>% select(ph, hyd_pressure1_bin, hyd_pressure2_bin, hyd_pressure3_bin), by = "hyd_pressure1_bin", ggtheme = theme_minimal())
+```
+
+#### Dual Distribution
+
+Although not as simple we can break down two distributions where one is not a zero modal distribution by finding a value that visually maximizes separation and utilizing that as the divider. We will follow this process for balling, density, and air_pressurer. The values simply get classified as low or high depending on their position relative to the breakpoint between distributions.
+
+After binning we can begin to see a slight relationship where the median pH increases if the density gets high.
+
+```{r}
+train <- train %>% 
+  mutate(
+    balling = as_factor(if_else(balling < 2.26, "low", "high")),
+    density = as_factor(if_else(density < 1.31, "low", "high")),
+    air_pressurer = as_factor(if_else(air_pressurer < 144.7, "low", "high"))) %>% 
+  rename(balling_bin = balling, density_bin = density, air_pressurer_bin = air_pressurer)
+
+test <- test %>% 
+  mutate(
+    balling = as_factor(if_else(balling < 2.26, "low", "high")),
+    density = as_factor(if_else(density < 1.31, "low", "high")),
+    air_pressurer = as_factor(if_else(air_pressurer < 144.7, "low", "high"))) %>% 
+  rename(balling_bin = balling, density_bin = density, air_pressurer_bin = air_pressurer)
+
+plot_boxplot(train %>% select(ph, density_bin), by = "density_bin", ggtheme = theme_minimal())
+```
+
+
+#### Triple Distribution
+
+For those with three distributions apparent, we once again utilize visual separation to best bin. We will follow this process for mnf_flow, carb_flow, balling_lvl, and alch_rel.
+
+```{r}
+train <- train %>% 
+  mutate(
+    mnf_flow = as_factor(case_when(
+      mnf_flow < -2 ~ "negative",
+      mnf_flow <= 2 ~ "zero",
+      mnf_flow > 2 ~ "positive"
+    )),
+    carb_flow = as_factor(case_when(
+      carb_flow < 400 ~ "low",
+      carb_flow <= 2500 ~ "mid",
+      carb_flow > 2500 ~ "high"      
+    )),
+    balling_lvl = as_factor(case_when(
+      balling_lvl == 0 ~ "zero",
+      balling_lvl < 2.5 ~ "low",
+      balling_lvl >= 2.5 ~ "high"            
+    )),
+    alch_rel =as_factor( case_when(
+      alch_rel < 6.8 ~ "low",
+      alch_rel < 7.5 ~ "mid",
+      alch_rel >= 7.5 ~ "high"          
+    ))) %>% 
+  rename(mnf_flow_bin = mnf_flow, carb_flow_bin = carb_flow, balling_lvl_bin = balling_lvl, alch_rel_bin = alch_rel)
+
+test <- test %>% 
+  mutate(
+    mnf_flow = as_factor(case_when(
+      mnf_flow < -2 ~ "negative",
+      mnf_flow <= 2 ~ "zero",
+      mnf_flow > 2 ~ "positive"
+    )),
+    carb_flow = as_factor(case_when(
+      carb_flow < 400 ~ "low",
+      carb_flow <= 2500 ~ "mid",
+      carb_flow > 2500 ~ "high"      
+    )),
+    balling_lvl = as_factor(case_when(
+      balling_lvl == 0 ~ "zero",
+      balling_lvl < 2.5 ~ "low",
+      balling_lvl >= 2.5 ~ "high"            
+    )),
+    alch_rel =as_factor( case_when(
+      alch_rel < 6.8 ~ "low",
+      alch_rel < 7.5 ~ "mid",
+      alch_rel >= 7.5 ~ "high"          
+    ))) %>% 
+  rename(mnf_flow_bin = mnf_flow, carb_flow_bin = carb_flow, balling_lvl_bin = balling_lvl, alch_rel_bin = alch_rel)
+
+plot_boxplot(train %>% select(ph, mnf_flow_bin), by = "mnf_flow_bin", ggtheme = theme_minimal())
+```
+
+After binning we're able to see that as the flow changes the median pH changes a decent amount as well. 
+
+#### Multiple Discrete
+
+These variables with more than three "distributions" are a bit special in that that they seem to be true discrete variables following consistent breaks between values. There's also a hint about the discrete nature of these variables with how they include "setpoint" in the name. There are specific set points that these variables can exist as. The only exception being values that were imputed in from mice which can simply be rounded to a closer true value. These variables are pressure_setpoint and bowl_setpoint.
+
+Pressure bowl_setpoint has breaks of 10 from 70 to 140, while pressure_setpoint has breaks of value 2 from 44 to 52. We use some clever combination rounding with division in order to enforce these for our imputed values.
+
+```{r}
+train <- train %>% 
+  mutate(pressure_setpoint = as_factor(2 * round(pressure_setpoint/2)),
+         bowl_setpoint = as_factor(10 * round(bowl_setpoint/10))) %>% 
+  rename(pressure_setpoint_bin = pressure_setpoint, bowl_setpoint_bin = bowl_setpoint)
+  
+test <- test %>% 
+  mutate(pressure_setpoint = as_factor(2 * round(pressure_setpoint/2)),
+         bowl_setpoint = as_factor(10 * round(bowl_setpoint/10))) %>% 
+  rename(pressure_setpoint_bin = pressure_setpoint, bowl_setpoint_bin = bowl_setpoint)
+  
+plot_boxplot(train %>% select(ph, bowl_setpoint_bin), by = "bowl_setpoint_bin", ggtheme = theme_minimal())
+```
+
+It's now easier to visualize how pH changes with either one of these variables.
+
+### Box-Cox Transform
+
+We tackle the variables that seem they can be nudged towards normality by finding the optimal lambda to box-cox transform them. This includes ph, carb_volume, psc, psc_co2, psc_fill, carb_pressure1, fill_pressure, filler_speed, hyd_pressure4, mfr, oxygen_filler, temperature, usage_cont, and carb_rel.
+
+For psc_co2 and psc_fill, which have zero values, we need to shift these columns to the right with a an addition of 0.001.
+
+We showcase a list of the lambdas that we will be using for transforming these columns below:
+
+```{r}
+train %>% 
+  select(ph, carb_volume, psc, psc_co2, psc_fill, carb_pressure1, fill_pressure, filler_speed, hyd_pressure4, mfr, oxygen_filler, temperature, usage_cont, carb_rel) %>% 
+  mutate(psc_co2 = psc_co2 + 0.001, psc_fill = psc_fill + 0.001) %>% 
+  lapply(BoxCoxTrans) -> lambdas
+
+lapply(lambdas, `[[`, "lambda")
+```
+
+We apply each of these lambdas towards box-cox transformations of our training set of data in order to bring the distributions closer to normality. We then visualize these newly transformed columns and compare them to our untransformed data from before.
+
+```{r}
+train <- train %>% 
+  mutate(psc_co2_trans = predict(lambdas$psc_co2, psc_co2 + 0.001),
+         psc_fill_trans = predict(lambdas$psc_fill, psc_fill + 0.001),
+         ph_trans = predict(lambdas$ph, ph),
+         carb_volume_trans = predict(lambdas$carb_volume, carb_volume),
+         psc_trans = predict(lambdas$psc, psc),
+         carb_pressure1_trans = predict(lambdas$carb_pressure1, carb_pressure1),
+         fill_pressure_trans = predict(lambdas$fill_pressure, fill_pressure),
+         filler_speed_trans = predict(lambdas$filler_speed, filler_speed),
+         hyd_pressure4_trans = predict(lambdas$hyd_pressure4, hyd_pressure4),
+         mfr_trans = predict(lambdas$mfr, mfr),
+         oxygen_filler_trans = predict(lambdas$oxygen_filler, oxygen_filler),
+         temperature_trans = predict(lambdas$temperature, temperature),
+         usage_cont_trans = predict(lambdas$usage_cont, usage_cont),
+         carb_rel_trans = predict(lambdas$carb_rel, carb_rel))
+
+plot_histogram(train %>% 
+                 select(c(ph_trans, carb_volume_trans, psc_trans, psc_co2_trans, psc_fill_trans, carb_pressure1_trans, fill_pressure_trans, filler_speed_trans, hyd_pressure4_trans, mfr_trans, oxygen_filler_trans, temperature_trans, usage_cont_trans, carb_rel_trans)))
+```
+
+It is this visualization that allows us to see that some transformations have had no noticeable effect and thus we should not use them. These categories include: carb_pressure1_trans, carb_rel_trans, carb_volume_trans, fill_pressure_trans, filler_speed_trans, hyd_pressure4_trans, ph_trans, psc_co2_trans, psc_fill_trans, temperature_trans, and usage_cont_trans.
+
+The columns where the transformation has led to a visible shift towards normality include: filler_speed_trans, mfr_trans, oxygen_filler_trans, and psc_trans. We remove the transformations that we do not want to apply from the training dataframe and then also apply the transformations that we have found to be helpful to testing dataframe.
+
+```{r}
+train <- train %>% 
+  select(-c(psc, mfr, oxygen_filler, filler_speed, ph_trans, carb_volume_trans, psc_co2_trans, psc_fill_trans, carb_pressure1_trans, fill_pressure_trans, hyd_pressure4_trans, temperature_trans, usage_cont_trans, carb_rel_trans))
+
+test <- test %>% 
+  mutate(filler_speed_trans = predict(lambdas$filler_speed, filler_speed),
+         psc_trans = predict(lambdas$psc, psc),
+         mfr_trans = predict(lambdas$mfr, mfr),
+         oxygen_filler_trans = predict(lambdas$oxygen_filler, oxygen_filler)) %>% 
+  select(-c(psc, mfr, oxygen_filler, filler_speed))
+
+glimpse(train)
+```
+
+We have now finished the processing portion of this project, and will save the processed data in .csv format so it can be shared between the team.
+
+```{r}
+train %>% 
+  write_csv("StudentDataProcessed.csv")
+
+test %>% 
+  write_csv("StudentEvaluationProcessed.csv")
+```
+
+### Correlate
+
+With our data promised we want to learn more about how the data interacts in other ways between features. The easiest way to do this is creating a correlation plot with the plot_correlation function from the DataExplorer package. We have to tweak the parameters to make the plot barely visible in a full screen view, but doing so gives us some insightful information:
+
+For our response variable of pH we do not have any strong correlations, but we do discover that the filler level, usage cont, mnf flow, and bowl setpoint are more correlated with it than the rest. Indicating that these are varaibles that we should definitely keep in our models.
+
+We also find a surprising amount of multicollinearity within our dataset. For example, our mfr feature is almost completely correlated to our filler speed feature. Additionally, we have the balling and density bins created also sharing extremely high correlation between each other. If either of these variable sets are used in our models then only one of them per set should be left in the end since they share quite similar information.
+
+Multicollinearity also appears in features that are measuring different dimensions of something such as carbonation temperature to carbonation pressure. This hints at building interaction variables for our models that have interactions between each related feature.
+
+```{r}
+DataExplorer::plot_correlation(train,
+  ggtheme = theme_minimal(),
+  theme_config = list(legend.position = "none", axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text.x = element_text(angle = 15, size = 5), axis.text.y = element_text(size = 5)))
+```
+
+We also take a different approach to visualizing correlation with the correlationfunnel package. This package provides a function which lays out correlation for categorical variables and is much easier to read when only trying to analyze correlation to a single variable (in our case this variable is ph split into a two level factor). It becomes much more clear that a negative mnf flow tends to correlate with a higher pH, there are specific bowl (120) and pressure (46) set points that encourage a higher pH beverage, and the first three hyd_pressures correlate better to a higher pH than the fourth. These all become variables we should focus on in our model building process.
+
+```{r, message=FALSE}
+require(correlationfunnel)
+
+train %>%
+  binarize(n_bins = 2, thresh_infreq = 0.01, name_infreq = "OTHER", one_hot = TRUE) %>% 
+  correlate(`ph__8.54_Inf`) %>% 
+  correlationfunnel::plot_correlation_funnel(alpha = 0.7, interactive = TRUE)
+```
+
+### Review
+
+Through our data preparation and exploration process here is what we have done:
+
+-   Loaded the training and test data then cleaned the column names.
+-   Removed missing values with multiple imputation.
+-   Removed a singular pH outlier that was much higher above the variable's distribution.
+-   Binned 12 of our numerical variables that had multiple innate distributions to become categorical variables.
+-   Box-cox transformed 4 of our numerical variables to reduce changes in variability over the distribution.
+-   Exported our transformed training and test data for sharing.
+-   Visualized correlation between variables in two different ways.
+
+
